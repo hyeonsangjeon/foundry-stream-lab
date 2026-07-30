@@ -294,8 +294,8 @@ a focused Microsoft Foundry routing, evaluation, and observability lab. See
 The rename also means GitHub's rolling traffic window can contain both the old
 and canonical repository paths. The
 [repository traffic attribution guide](docs/repository-traffic.md) defines the
-separate metrics and the repeatable capture workflow; legacy-path views are not
-treated as new-name content interest.
+separate metrics and the repeatable capture workflow; legacy-path views and
+repository-level clone totals are not treated as new-name content interest.
 
 ## License and provenance
 

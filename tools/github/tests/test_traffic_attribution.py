@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -74,6 +76,36 @@ def current_paths() -> list[dict]:
     ]
 
 
+def followup_paths() -> list[dict]:
+    paths = current_paths()
+    paths[1] = paths[1] | {"count": 3}
+    return paths
+
+
+def clones_payload(*, count: int = 332, uniques: int = 109) -> dict:
+    return {
+        "count": count,
+        "uniques": uniques,
+        "clones": [
+            {
+                "timestamp": "2026-07-16T00:00:00Z",
+                "count": 99,
+                "uniques": 30,
+            },
+            {
+                "timestamp": "2026-07-17T00:00:00Z",
+                "count": 177,
+                "uniques": 56,
+            },
+            {
+                "timestamp": "2026-07-18T00:00:00Z",
+                "count": 56,
+                "uniques": 40,
+            },
+        ],
+    }
+
+
 def build(**overrides):
     arguments = {
         "repository": "hyeonsangjeon/foundry-stream-lab",
@@ -81,6 +113,7 @@ def build(**overrides):
         "renamed_at": utc("2026-07-17T05:39:55Z"),
         "now": utc("2026-07-21T16:12:09Z"),
         "views_payload": views_payload(),
+        "clones_payload": clones_payload(),
         "paths_payload": current_paths(),
         "referrers_payload": [{"referrer": "github.com", "count": 11, "uniques": 1}],
     }
@@ -104,6 +137,7 @@ class TrafficAttributionTests(unittest.TestCase):
         self.assertEqual(report["metrics"]["top_path_coverage"], 1.0)
         self.assertEqual(report["metrics"]["legacy_known_top_path_views"], 9)
         self.assertEqual(report["rawResponses"]["views"]["count"], 11)
+        self.assertEqual(report["rawResponses"]["clones"]["count"], 332)
         self.assertIn("total_views", report["metricDefinitions"])
         self.assertEqual(report["interpretation"]["status"], "rename-window-ambiguous")
         self.assertFalse(report["interpretation"]["contentInterestInferred"])
@@ -112,6 +146,21 @@ class TrafficAttributionTests(unittest.TestCase):
                 "totalRepositoryViewsFullyAttributedToCanonicalPaths"
             ]
         )
+        self.assertFalse(report["interpretation"]["cloneDemandInferred"])
+        self.assertFalse(report["interpretation"]["cloneSlugAttributionAvailable"])
+
+    def test_followup_snapshot_splits_nine_legacy_and_three_canonical_views(self):
+        report = build(
+            views_payload=views_payload(count=12),
+            paths_payload=followup_paths(),
+            referrers_payload=[{"referrer": "github.com", "count": 12, "uniques": 1}],
+        )
+
+        self.assertEqual(report["metrics"]["total_views"], 12)
+        self.assertEqual(report["metrics"]["canonical_known_top_path_views"], 3)
+        self.assertEqual(report["metrics"]["legacy_known_top_path_views"], 9)
+        self.assertEqual(report["metrics"]["not_in_top_paths_views"], 0)
+        self.assertEqual(report["referrers"][0]["views"], 12)
 
     def test_repository_matching_requires_an_exact_path_boundary(self):
         paths = [
@@ -167,6 +216,69 @@ class TrafficAttributionTests(unittest.TestCase):
         self.assertNotIn("uniqueVisitors", attribution["groups"]["legacy"])
         self.assertEqual(sum(row["uniqueVisitors"] for row in attribution["paths"]), 5)
         self.assertEqual(report["totals"]["uniqueVisitors"], 1)
+
+    def test_clone_totals_are_preserved_without_slug_attribution(self):
+        report = build()
+        clone_traffic = report["cloneTraffic"]
+
+        self.assertTrue(clone_traffic["available"])
+        self.assertEqual(clone_traffic["clones"], 332)
+        self.assertEqual(clone_traffic["uniqueCloners"], 109)
+        self.assertEqual(clone_traffic["dailyClonesSum"], 332)
+        self.assertTrue(clone_traffic["dailyClonesMatchTotal"])
+        self.assertFalse(clone_traffic["dailyUniqueClonersAdditive"])
+        self.assertFalse(clone_traffic["slugAttributionAvailable"])
+        self.assertFalse(clone_traffic["requestedRepositorySlugAvailable"])
+        self.assertEqual(
+            clone_traffic["dateRelationCounts"],
+            {
+                "preRenameDateClones": 99,
+                "renameDateClones": 177,
+                "postRenameDateClones": 56,
+            },
+        )
+        self.assertEqual(report["metrics"]["total_clones"], 332)
+        self.assertEqual(report["metrics"]["unique_cloners"], 109)
+        self.assertIn(
+            "Canonical/legacy clone attribution", TRAFFIC.render_markdown(report)
+        )
+
+    def test_clone_daily_total_mismatch_is_reported_without_rejection(self):
+        report = build(clones_payload=clones_payload(count=333))
+
+        self.assertEqual(report["cloneTraffic"]["dailyClonesSum"], 332)
+        self.assertFalse(report["cloneTraffic"]["dailyClonesMatchTotal"])
+        self.assertIn(
+            "Daily clone buckets sum to `332`, but the endpoint total is `333`",
+            TRAFFIC.render_markdown(report),
+        )
+
+    def test_duplicate_clone_timestamp_is_rejected(self):
+        payload = clones_payload()
+        payload["clones"].append(payload["clones"][0])
+
+        with self.assertRaisesRegex(
+            TRAFFIC.TrafficAttributionError, "duplicate timestamp"
+        ):
+            build(clones_payload=payload)
+
+    def test_invalid_clone_count_is_rejected(self):
+        payload = clones_payload()
+        payload["clones"][0]["count"] = True
+
+        with self.assertRaisesRegex(
+            TRAFFIC.TrafficAttributionError, "must be a non-negative integer"
+        ):
+            build(clones_payload=payload)
+
+    def test_invalid_clone_timestamp_is_rejected(self):
+        payload = clones_payload()
+        payload["clones"][0]["timestamp"] = "not-a-timestamp"
+
+        with self.assertRaisesRegex(
+            TRAFFIC.TrafficAttributionError, "not a valid ISO-8601 timestamp"
+        ):
+            build(clones_payload=payload)
 
     def test_legacy_paths_after_window_receive_a_distinct_status(self):
         daily = [
@@ -264,6 +376,7 @@ class TrafficAttributionTests(unittest.TestCase):
             root = Path(directory)
             inputs = {
                 "views.json": views_payload(),
+                "clones.json": clones_payload(),
                 "paths.json": current_paths(),
                 "referrers.json": [
                     {"referrer": "github.com", "count": 11, "uniques": 1}
@@ -273,6 +386,7 @@ class TrafficAttributionTests(unittest.TestCase):
                 (root / name).write_text(json.dumps(payload), encoding="utf-8")
             output_json = root / "out" / "traffic.json"
             output_markdown = root / "out" / "traffic.md"
+            archive_root = root / "archive"
             arguments = [
                 "--repository",
                 "hyeonsangjeon/foundry-stream-lab",
@@ -284,6 +398,8 @@ class TrafficAttributionTests(unittest.TestCase):
                 "2026-07-21T16:12:09Z",
                 "--views-file",
                 str(root / "views.json"),
+                "--clones-file",
+                str(root / "clones.json"),
                 "--paths-file",
                 str(root / "paths.json"),
                 "--referrers-file",
@@ -292,6 +408,8 @@ class TrafficAttributionTests(unittest.TestCase):
                 str(output_json),
                 "--output-markdown",
                 str(output_markdown),
+                "--archive-directory",
+                str(archive_root),
             ]
 
             self.assertEqual(TRAFFIC.main(arguments), 0)
@@ -300,11 +418,142 @@ class TrafficAttributionTests(unittest.TestCase):
             self.assertEqual(TRAFFIC.main(arguments), 0)
             self.assertEqual(output_json.read_bytes(), first_json)
             self.assertEqual(output_markdown.read_bytes(), first_markdown)
-            self.assertEqual(json.loads(first_json)["schemaVersion"], 1)
+            self.assertEqual(json.loads(first_json)["schemaVersion"], 2)
+            archive = archive_root / "2026-07-21T161209Z"
+            self.assertEqual((archive / "snapshot.json").read_bytes(), first_json)
+            self.assertEqual((archive / "summary.md").read_bytes(), first_markdown)
+            expected_checksums = (
+                f"{hashlib.sha256(first_json).hexdigest()}  snapshot.json\n"
+                f"{hashlib.sha256(first_markdown).hexdigest()}  summary.md\n"
+            )
+            self.assertEqual(
+                (archive / "checksums.sha256").read_text(encoding="utf-8"),
+                expected_checksums,
+            )
 
-    def test_live_collection_uses_three_versioned_gh_api_requests(self):
+    def test_three_file_offline_mode_remains_compatible_without_clone_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = {
+                "views.json": views_payload(),
+                "paths.json": current_paths(),
+                "referrers.json": [
+                    {"referrer": "github.com", "count": 11, "uniques": 1}
+                ],
+            }
+            for name, payload in inputs.items():
+                (root / name).write_text(json.dumps(payload), encoding="utf-8")
+            output_json = root / "traffic.json"
+            output_markdown = root / "traffic.md"
+
+            self.assertEqual(
+                TRAFFIC.main(
+                    [
+                        "--repository",
+                        "hyeonsangjeon/foundry-stream-lab",
+                        "--legacy-repository",
+                        "hyeonsangjeon/kafka-metric-example",
+                        "--renamed-at",
+                        "2026-07-17T05:39:55Z",
+                        "--now",
+                        "2026-07-21T16:12:09Z",
+                        "--views-file",
+                        str(root / "views.json"),
+                        "--paths-file",
+                        str(root / "paths.json"),
+                        "--referrers-file",
+                        str(root / "referrers.json"),
+                        "--output-json",
+                        str(output_json),
+                        "--output-markdown",
+                        str(output_markdown),
+                    ]
+                ),
+                0,
+            )
+
+            report = json.loads(output_json.read_text(encoding="utf-8"))
+            self.assertFalse(report["sourceAvailability"]["clones"])
+            self.assertIsNone(report["metrics"]["total_clones"])
+            self.assertIn(
+                "Clone input was not supplied",
+                output_markdown.read_text(encoding="utf-8"),
+            )
+
+    def test_archive_timestamp_is_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = build()
+            TRAFFIC._archive_report(
+                root,
+                report,
+                json_content=TRAFFIC.render_json(report),
+                markdown_content=TRAFFIC.render_markdown(report),
+            )
+            changed = build(views_payload=views_payload(count=12))
+
+            with self.assertRaisesRegex(
+                TRAFFIC.TrafficAttributionError,
+                "archive file already exists with different content",
+            ):
+                TRAFFIC._archive_report(
+                    root,
+                    changed,
+                    json_content=TRAFFIC.render_json(changed),
+                    markdown_content=TRAFFIC.render_markdown(changed),
+                )
+
+    def test_concurrent_archive_collision_never_mixes_evidence_sets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reports = [
+                build(),
+                build(views_payload=views_payload(count=12)),
+            ]
+
+            def publish(report):
+                try:
+                    return (
+                        "ok",
+                        TRAFFIC._archive_report(
+                            root,
+                            report,
+                            json_content=TRAFFIC.render_json(report),
+                            markdown_content=TRAFFIC.render_markdown(report),
+                        ),
+                    )
+                except TRAFFIC.TrafficAttributionError as exc:
+                    return ("error", str(exc))
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(publish, reports))
+
+            self.assertEqual([status for status, _ in results].count("ok"), 1)
+            self.assertEqual([status for status, _ in results].count("error"), 1)
+            destination = root / "2026-07-21T161209Z"
+            archived_pair = (
+                (destination / "snapshot.json").read_text(encoding="utf-8"),
+                (destination / "summary.md").read_text(encoding="utf-8"),
+            )
+            expected_pairs = {
+                (TRAFFIC.render_json(report), TRAFFIC.render_markdown(report))
+                for report in reports
+            }
+            self.assertIn(archived_pair, expected_pairs)
+            checksums = (destination / "checksums.sha256").read_text(encoding="utf-8")
+            self.assertEqual(
+                checksums,
+                f"{hashlib.sha256(archived_pair[0].encode()).hexdigest()}  snapshot.json\n"
+                f"{hashlib.sha256(archived_pair[1].encode()).hexdigest()}  summary.md\n",
+            )
+            self.assertEqual(
+                [path for path in root.iterdir() if path.name.startswith(".")], []
+            )
+
+    def test_live_collection_uses_four_versioned_gh_api_requests(self):
         responses = [
             subprocess.CompletedProcess([], 0, json.dumps(views_payload()), ""),
+            subprocess.CompletedProcess([], 0, json.dumps(clones_payload()), ""),
             subprocess.CompletedProcess([], 0, json.dumps(current_paths()), ""),
             subprocess.CompletedProcess(
                 [],
@@ -314,18 +563,20 @@ class TrafficAttributionTests(unittest.TestCase):
             ),
         ]
         with mock.patch.object(TRAFFIC.subprocess, "run", side_effect=responses) as run:
-            views, paths, referrers = TRAFFIC.collect_live(
+            views, clones, paths, referrers = TRAFFIC.collect_live(
                 "hyeonsangjeon/foundry-stream-lab"
             )
 
         self.assertEqual(views["count"], 11)
+        self.assertEqual(clones["count"], 332)
         self.assertEqual(len(paths), 5)
         self.assertEqual(referrers[0]["referrer"], "github.com")
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 4)
         commands = [call.args[0] for call in run.call_args_list]
         self.assertTrue(commands[0][-1].endswith("/traffic/views"))
-        self.assertTrue(commands[1][-1].endswith("/traffic/popular/paths"))
-        self.assertTrue(commands[2][-1].endswith("/traffic/popular/referrers"))
+        self.assertTrue(commands[1][-1].endswith("/traffic/clones"))
+        self.assertTrue(commands[2][-1].endswith("/traffic/popular/paths"))
+        self.assertTrue(commands[3][-1].endswith("/traffic/popular/referrers"))
         self.assertIn(f"X-GitHub-Api-Version: {TRAFFIC.API_VERSION}", commands[0])
 
     def test_partial_offline_input_is_rejected(self):
@@ -347,6 +598,70 @@ class TrafficAttributionTests(unittest.TestCase):
                         str(root / "views.json"),
                         "--output-json",
                         str(root / "out.json"),
+                        "--output-markdown",
+                        str(root / "out.md"),
+                    ]
+                )
+
+    def test_clones_only_offline_input_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "clones.json").write_text(
+                json.dumps(clones_payload()), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                TRAFFIC.TrafficAttributionError, "--clones-file requires"
+            ):
+                TRAFFIC.main(
+                    [
+                        "--repository",
+                        "hyeonsangjeon/foundry-stream-lab",
+                        "--legacy-repository",
+                        "hyeonsangjeon/kafka-metric-example",
+                        "--renamed-at",
+                        "2026-07-17T05:39:55Z",
+                        "--clones-file",
+                        str(root / "clones.json"),
+                        "--output-json",
+                        str(root / "out.json"),
+                        "--output-markdown",
+                        str(root / "out.md"),
+                    ]
+                )
+
+    def test_output_cannot_overwrite_clone_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = {
+                "views.json": views_payload(),
+                "clones.json": clones_payload(),
+                "paths.json": current_paths(),
+                "referrers.json": [],
+            }
+            for name, payload in inputs.items():
+                (root / name).write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                TRAFFIC.TrafficAttributionError,
+                "output paths must not overwrite offline input files",
+            ):
+                TRAFFIC.main(
+                    [
+                        "--repository",
+                        "hyeonsangjeon/foundry-stream-lab",
+                        "--legacy-repository",
+                        "hyeonsangjeon/kafka-metric-example",
+                        "--renamed-at",
+                        "2026-07-17T05:39:55Z",
+                        "--views-file",
+                        str(root / "views.json"),
+                        "--clones-file",
+                        str(root / "clones.json"),
+                        "--paths-file",
+                        str(root / "paths.json"),
+                        "--referrers-file",
+                        str(root / "referrers.json"),
+                        "--output-json",
+                        str(root / "clones.json"),
                         "--output-markdown",
                         str(root / "out.md"),
                     ]
