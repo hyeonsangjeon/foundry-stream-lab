@@ -30,12 +30,13 @@ web-test: ## Run frontend lint, tests, and production build
 
 test: backend-test web-test ## Run all checks
 
-repository-traffic: ## Capture and classify the rolling GitHub traffic window
+repository-traffic: ## Capture views, clones, and rename attribution
 	mkdir -p tmp/repository-traffic
 	python3 tools/github/traffic_attribution.py \
 		--repository hyeonsangjeon/foundry-stream-lab \
 		--legacy-repository hyeonsangjeon/kafka-metric-example \
 		--renamed-at 2026-07-17T05:39:55Z \
+		--archive-directory tmp/repository-traffic/archive \
 		--output-json tmp/repository-traffic/snapshot.json \
 		--output-markdown tmp/repository-traffic/summary.md
 	@cat tmp/repository-traffic/summary.md

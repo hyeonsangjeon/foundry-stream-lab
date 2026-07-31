@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -137,10 +139,11 @@ def _gh_api(endpoint: str) -> Any:
         ) from exc
 
 
-def collect_live(repository: str) -> tuple[Any, Any, Any]:
+def collect_live(repository: str) -> tuple[Any, Any, Any, Any]:
     base = f"repos/{repository}/traffic"
     return (
         _gh_api(f"{base}/views"),
+        _gh_api(f"{base}/clones"),
         _gh_api(f"{base}/popular/paths"),
         _gh_api(f"{base}/popular/referrers"),
     )
@@ -186,6 +189,36 @@ def _normalize_daily_views(views_payload: Mapping[str, Any]) -> list[dict[str, A
                 ),
                 "uniqueVisitors": _non_negative_integer(
                     row.get("uniques"), field=f"views.views[{index}].uniques"
+                ),
+            }
+        )
+    return sorted(daily, key=lambda row: row["timestamp"])
+
+
+def _normalize_daily_clones(clones_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    daily_payload = _require_list(clones_payload.get("clones"), field="clones.clones")
+    daily: list[dict[str, Any]] = []
+    seen_timestamps: set[str] = set()
+    for index, raw_row in enumerate(daily_payload):
+        row = _require_mapping(raw_row, field=f"clones.clones[{index}]")
+        parsed = parse_timestamp(
+            _string(row.get("timestamp"), field=f"clones.clones[{index}].timestamp"),
+            field=f"clones.clones[{index}].timestamp",
+        )
+        timestamp = format_timestamp(parsed)
+        if timestamp in seen_timestamps:
+            raise TrafficAttributionError(
+                f"clones.clones contains duplicate timestamp {timestamp}"
+            )
+        seen_timestamps.add(timestamp)
+        daily.append(
+            {
+                "timestamp": timestamp,
+                "clones": _non_negative_integer(
+                    row.get("count"), field=f"clones.clones[{index}].count"
+                ),
+                "uniqueCloners": _non_negative_integer(
+                    row.get("uniques"), field=f"clones.clones[{index}].uniques"
                 ),
             }
         )
@@ -299,6 +332,29 @@ def _window(
     }
 
 
+def _clone_date_relation_counts(
+    daily_clones: Sequence[Mapping[str, Any]], *, renamed_at: datetime
+) -> dict[str, int]:
+    rename_date = renamed_at.date()
+    counts = {
+        "preRenameDateClones": 0,
+        "renameDateClones": 0,
+        "postRenameDateClones": 0,
+    }
+    for row in daily_clones:
+        clone_date = parse_timestamp(
+            row["timestamp"], field="daily clone timestamp"
+        ).date()
+        if clone_date < rename_date:
+            key = "preRenameDateClones"
+        elif clone_date == rename_date:
+            key = "renameDateClones"
+        else:
+            key = "postRenameDateClones"
+        counts[key] += row["clones"]
+    return counts
+
+
 def _percentage(numerator: int, denominator: int) -> float | None:
     if denominator == 0:
         return 0.0 if numerator == 0 else None
@@ -320,6 +376,7 @@ def build_report(
     views_payload: Any,
     paths_payload: Any,
     referrers_payload: Any,
+    clones_payload: Any | None = None,
 ) -> dict[str, Any]:
     canonical = normalize_repository(repository, field="repository")
     if renamed_at > now:
@@ -346,6 +403,25 @@ def build_report(
     total_views = _non_negative_integer(views.get("count"), field="views.count")
     total_uniques = _non_negative_integer(views.get("uniques"), field="views.uniques")
     daily_views = _normalize_daily_views(views)
+    if clones_payload is None:
+        total_clones = None
+        total_unique_cloners = None
+        daily_clones: list[dict[str, Any]] = []
+        daily_clone_sum = None
+        clone_window = None
+        clone_date_relation_counts = None
+    else:
+        clones = _require_mapping(clones_payload, field="clones")
+        total_clones = _non_negative_integer(clones.get("count"), field="clones.count")
+        total_unique_cloners = _non_negative_integer(
+            clones.get("uniques"), field="clones.uniques"
+        )
+        daily_clones = _normalize_daily_clones(clones)
+        daily_clone_sum = sum(row["clones"] for row in daily_clones)
+        clone_window = _window(daily_clones, now=now, renamed_at=renamed_at)
+        clone_date_relation_counts = _clone_date_relation_counts(
+            daily_clones, renamed_at=renamed_at
+        )
     paths = _normalize_paths(
         paths_payload, canonical=canonical, legacy=deduplicated_legacy
     )
@@ -398,8 +474,35 @@ def build_report(
     return {
         "analyzedAt": format_timestamp(now),
         "apiVersion": API_VERSION,
+        "cloneTraffic": {
+            "available": clones_payload is not None,
+            "byDay": daily_clones,
+            "clones": total_clones,
+            "dailyClonesMatchTotal": (
+                daily_clone_sum == total_clones if clones_payload is not None else None
+            ),
+            "dailyClonesSum": daily_clone_sum,
+            "dailyUniqueClonersAdditive": False,
+            "dateRelationCounts": clone_date_relation_counts,
+            "fetchesIncluded": False if clones_payload is not None else None,
+            "fullClonesOnly": True if clones_payload is not None else None,
+            "requestedRepositorySlugAvailable": (
+                False if clones_payload is not None else None
+            ),
+            "scope": "repository-aggregate" if clones_payload is not None else None,
+            "slugAttributionAvailable": (False if clones_payload is not None else None),
+            "uniqueClonerAuthority": (
+                "clones.uniques" if clones_payload is not None else None
+            ),
+            "uniqueCloners": total_unique_cloners,
+            "window": clone_window,
+        },
         "interpretation": {
             "canonicalKnownTopPathViews": group_views["canonical"],
+            "cloneDemandInferred": False,
+            "cloneSlugAttributionAvailable": (
+                False if clones_payload is not None else None
+            ),
             "contentInterestInferred": False,
             "pathByDateAvailable": False,
             "status": status,
@@ -409,7 +512,9 @@ def build_report(
             "popular paths returns at most 10 rows",
             "path-level unique visitors overlap and are not additive",
             "GitHub does not expose path-by-date traffic",
-            "rename-day views cannot be split into pre-rename and redirect traffic",
+            "rename-day views cannot be split into pre-rename and post-rename traffic",
+            "clone traffic does not expose the requested canonical or legacy repository slug",
+            "daily unique cloners overlap and are not additive",
         ],
         "metricDefinitions": {
             "canonical_known_top_path_views": (
@@ -425,7 +530,9 @@ def build_report(
                 "views in returned popular paths matching neither canonical nor legacy boundaries"
             ),
             "top_path_coverage": "returned popular-path views divided by total repository views",
+            "total_clones": "rolling full-clone count from traffic/clones; fetches are excluded",
             "total_views": "rolling repository view count from traffic/views",
+            "unique_cloners": "authoritative rolling unique count from traffic/clones uniques",
             "unique_visitors": "authoritative rolling unique count from traffic/views uniques",
         },
         "metrics": {
@@ -434,7 +541,9 @@ def build_report(
             "not_in_top_paths_views": unattributed_views,
             "other_known_top_path_views": group_views["other"],
             "top_path_coverage": _ratio(listed_views, total_views),
+            "total_clones": total_clones,
             "total_views": total_views,
+            "unique_cloners": total_unique_cloners,
             "unique_visitors": total_uniques,
         },
         "pathAttribution": {
@@ -453,6 +562,7 @@ def build_report(
         },
         "referrers": referrers,
         "rawResponses": {
+            "clones": clones_payload,
             "popularPaths": paths_payload,
             "popularReferrers": referrers_payload,
             "views": views_payload,
@@ -462,10 +572,25 @@ def build_report(
             "renamedAt": format_timestamp(renamed_at),
         },
         "repository": canonical,
-        "schemaVersion": 1,
+        "schemaVersion": 2,
+        "sourceAvailability": {
+            "clones": clones_payload is not None,
+            "popularPaths": True,
+            "popularReferrers": True,
+            "views": True,
+        },
         "totals": {
+            "clones": total_clones,
+            "dailyClonesMatchTotal": (
+                daily_clone_sum == total_clones if clones_payload is not None else None
+            ),
+            "dailyClonesSum": daily_clone_sum,
             "dailyViewsMatchTotal": daily_sum == total_views,
             "dailyViewsSum": daily_sum,
+            "uniqueClonerAuthority": (
+                "clones.uniques" if clones_payload is not None else None
+            ),
+            "uniqueCloners": total_unique_cloners,
             "uniqueVisitorAuthority": "views.uniques",
             "uniqueVisitors": total_uniques,
             "views": total_views,
@@ -499,8 +624,9 @@ def _decision_text(status: str) -> str:
             "path-by-date cross-tab."
         ),
         "legacy-paths-after-rename-window": (
-            "Legacy paths remain after the rename window. Treat them as redirect or stale-link "
-            "traffic and investigate backlinks separately."
+            "Legacy-labelled paths remain after the rename window. GitHub does not document "
+            "whether these labels represent redirected requests or another analytics mapping, "
+            "so keep the mapping unverified and investigate backlinks separately."
         ),
         "incomplete-path-attribution": (
             "Popular paths do not fully and exclusively attribute the total. Keep canonical, "
@@ -516,6 +642,7 @@ def _decision_text(status: str) -> str:
 def render_markdown(report: Mapping[str, Any]) -> str:
     totals = report["totals"]
     attribution = report["pathAttribution"]
+    clone_traffic = report["cloneTraffic"]
     window = report["window"]
     rename = report["rename"]
     interpretation = report["interpretation"]
@@ -538,6 +665,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "| --- | ---: |",
         f"| Total repository views | {totals['views']} |",
         f"| Overall unique visitors | {totals['uniqueVisitors']} |",
+        f"| Total full clones | {totals['clones'] if totals['clones'] is not None else 'n/a'} |",
+        f"| Overall unique cloners | "
+        f"{totals['uniqueCloners'] if totals['uniqueCloners'] is not None else 'n/a'} |",
         f"| Canonical popular-path views | {groups['canonical']['views']} |",
         f"| Legacy popular-path views | {groups['legacy']['views']} |",
         f"| Other popular-path views | {groups['other']['views']} |",
@@ -579,6 +709,58 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"- Window overlaps rename: `{'yes' if window['windowOverlapsRename'] else 'no'}`",
             "- Path-by-date attribution: unavailable from the GitHub Traffic API",
             "",
+        ]
+    )
+    lines.extend(["## Clone traffic", ""])
+    if clone_traffic["available"]:
+        clone_window = clone_traffic["window"]
+        relation_counts = clone_traffic["dateRelationCounts"]
+        lines.extend(
+            [
+                f"- Rolling window: `{clone_window['startDateUtc']}` through "
+                f"`{clone_window['endDateUtc']}` UTC",
+                f"- Full clones: `{clone_traffic['clones']}`",
+                f"- Unique cloners: `{clone_traffic['uniqueCloners']}` from `clones.uniques`",
+                "- Fetches included: `no`",
+                "- Requested canonical/legacy clone URL available: `no`",
+                "- Canonical/legacy clone attribution: `unavailable`",
+                "",
+            ]
+        )
+        if not clone_traffic["dailyClonesMatchTotal"]:
+            lines.extend(
+                [
+                    "**Warning:** Daily clone buckets sum to "
+                    f"`{clone_traffic['dailyClonesSum']}`, but the endpoint total is "
+                    f"`{clone_traffic['clones']}`. Treat the date-relation breakdown as "
+                    "temporarily inconsistent.",
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                "| Clone date relation | Clones |",
+                "| --- | ---: |",
+                f"| Before rename UTC date | {relation_counts['preRenameDateClones']} |",
+                "| Rename UTC date (ambiguous within the day) | "
+                f"{relation_counts['renameDateClones']} |",
+                f"| After rename UTC date | {relation_counts['postRenameDateClones']} |",
+                "",
+                "Date relation is not slug attribution. GitHub does not return the repository "
+                "URL used for a clone, and daily unique-cloner counts are intentionally not summed.",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Clone input was not supplied. Clone totals and slug-attribution constraints "
+                "cannot be evaluated in this offline compatibility mode.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
             "## Popular referrers",
             "",
             "| Referrer | Views | Referrer uniques |",
@@ -601,7 +783,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "- `views` is the rolling repository total; it is not automatically a content-interest KPI.",
             "- Canonical, legacy, and other counts cover only the popular paths returned by GitHub.",
             "- Path-level unique counts are non-additive; use the overall unique visitor count above.",
-            "- A rename-day view cannot be split into pre-rename and post-redirect traffic.",
+            "- A rename-day view cannot be split into pre-rename and post-rename traffic.",
+            "- Clone totals are repository-level full clones and cannot be split by canonical "
+            "versus legacy clone URL.",
             "",
         ]
     )
@@ -624,6 +808,69 @@ def _atomic_write(path: Path, content: str) -> None:
             pass
 
 
+def _verify_archive(destination: Path, expected: Mapping[str, str]) -> None:
+    for name, content in expected.items():
+        path = destination / name
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise TrafficAttributionError(
+                f"archive directory is incomplete: {destination}"
+            ) from exc
+        except OSError as exc:
+            raise TrafficAttributionError(
+                f"could not read archive file {path}: {exc}"
+            ) from exc
+        if existing != content:
+            raise TrafficAttributionError(
+                f"archive file already exists with different content: {path}"
+            )
+
+
+def _archive_report(
+    directory: Path,
+    report: Mapping[str, Any],
+    *,
+    json_content: str,
+    markdown_content: str,
+) -> Path:
+    analyzed_at = parse_timestamp(report["analyzedAt"], field="analyzedAt")
+    archive_key = analyzed_at.strftime("%Y-%m-%dT%H%M%SZ")
+    destination = directory / archive_key
+    checksums = (
+        f"{hashlib.sha256(json_content.encode('utf-8')).hexdigest()}  snapshot.json\n"
+        f"{hashlib.sha256(markdown_content.encode('utf-8')).hexdigest()}  summary.md\n"
+    )
+    expected = {
+        "snapshot.json": json_content,
+        "summary.md": markdown_content,
+        "checksums.sha256": checksums,
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        _verify_archive(destination, expected)
+        return destination
+
+    staging = Path(tempfile.mkdtemp(prefix=f".{archive_key}.", dir=str(directory)))
+    try:
+        for name, content in expected.items():
+            _atomic_write(staging / name, content)
+        try:
+            os.rename(staging, destination)
+        except OSError as exc:
+            if not destination.exists():
+                raise TrafficAttributionError(
+                    f"could not publish archive directory {destination}: {exc}"
+                ) from exc
+            _verify_archive(destination, expected)
+        else:
+            staging = None
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+    return destination
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Classify GitHub traffic across canonical and renamed repository paths."
@@ -643,7 +890,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--output-markdown", required=True, type=Path)
     parser.add_argument(
+        "--archive-directory",
+        type=Path,
+        help="Optional private directory for immutable timestamped output and checksums",
+    )
+    parser.add_argument(
         "--views-file", type=Path, help="Offline raw traffic/views JSON"
+    )
+    parser.add_argument(
+        "--clones-file", type=Path, help="Offline raw traffic/clones JSON"
     )
     parser.add_argument(
         "--paths-file", type=Path, help="Offline raw traffic/popular/paths JSON"
@@ -671,29 +926,50 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise TrafficAttributionError(
             "renamed-at must not be later than the analysis timestamp"
         )
-    offline_paths = [args.views_file, args.paths_file, args.referrers_file]
-    if any(path is not None for path in offline_paths) and not all(
-        path is not None for path in offline_paths
+    required_offline_paths = [
+        args.views_file,
+        args.paths_file,
+        args.referrers_file,
+    ]
+    if any(path is not None for path in required_offline_paths) and not all(
+        path is not None for path in required_offline_paths
     ):
         raise TrafficAttributionError(
             "--views-file, --paths-file, and --referrers-file must be provided together"
+        )
+    if args.clones_file is not None and not all(
+        path is not None for path in required_offline_paths
+    ):
+        raise TrafficAttributionError(
+            "--clones-file requires --views-file, --paths-file, and --referrers-file"
         )
     output_paths = {args.output_json.resolve(), args.output_markdown.resolve()}
     if len(output_paths) != 2:
         raise TrafficAttributionError(
             "JSON and Markdown outputs must use different paths"
         )
-    if all(path is not None for path in offline_paths):
-        input_paths = {path.resolve() for path in offline_paths}
+    if all(path is not None for path in required_offline_paths):
+        supplied_input_paths = [
+            *required_offline_paths,
+            *([args.clones_file] if args.clones_file is not None else []),
+        ]
+        input_paths = {path.resolve() for path in supplied_input_paths}
         if output_paths & input_paths:
             raise TrafficAttributionError(
                 "output paths must not overwrite offline input files"
             )
         views_payload = _read_json(args.views_file, field="views file")
+        clones_payload = (
+            _read_json(args.clones_file, field="clones file")
+            if args.clones_file is not None
+            else None
+        )
         paths_payload = _read_json(args.paths_file, field="paths file")
         referrers_payload = _read_json(args.referrers_file, field="referrers file")
     else:
-        views_payload, paths_payload, referrers_payload = collect_live(repository)
+        views_payload, clones_payload, paths_payload, referrers_payload = collect_live(
+            repository
+        )
 
     report = build_report(
         repository=repository,
@@ -703,9 +979,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         views_payload=views_payload,
         paths_payload=paths_payload,
         referrers_payload=referrers_payload,
+        clones_payload=clones_payload,
     )
-    _atomic_write(args.output_json, render_json(report))
-    _atomic_write(args.output_markdown, render_markdown(report))
+    json_content = render_json(report)
+    markdown_content = render_markdown(report)
+    if args.archive_directory is not None:
+        archive_path = _archive_report(
+            args.archive_directory,
+            report,
+            json_content=json_content,
+            markdown_content=markdown_content,
+        )
+        print(f"Archived private traffic evidence: {archive_path}", file=sys.stderr)
+    _atomic_write(args.output_json, json_content)
+    _atomic_write(args.output_markdown, markdown_content)
     return 0
 
 
