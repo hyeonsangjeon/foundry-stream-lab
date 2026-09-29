@@ -31,7 +31,7 @@
     <kafka.version>4.3.1</kafka.version>
     <azure.ai.agents.version>2.0.1</azure.ai.agents.version>
     <azure.identity.version>1.18.4</azure.identity.version>
-    <jackson.databind.version>2.18.9</jackson.databind.version>
+    <jackson.databind.version>2.18.10</jackson.databind.version>
     <junit.version>5.14.4</junit.version>
   </properties>
 
